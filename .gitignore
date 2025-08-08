@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.env.*
+
+# VSCode/IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+
+# Notebooks
+*.ipynb_checkpoints/
+
+# Model cache
+model_cache/*.joblib
+
+# Large local files (keep out of git; use LFS if needed)
+*.xlsx
+*.csv
+*.zip

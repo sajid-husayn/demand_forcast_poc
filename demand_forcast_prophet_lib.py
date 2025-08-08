@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from prophet import Prophet
 from datetime import datetime
@@ -11,12 +12,16 @@ import numpy as np
 from typing import Optional, List, Dict
 import logging
 
-# Configuration
-MONGO_URI = "mongodb+srv://syedhussain:OZHk1GTYKSUBvIUM@cluster0.cwo0vp8.mongodb.net/"
-DATABASE_NAME = "taniaWaters"
-COLLECTION_NAME = "orderData"
-MODEL_CACHE_DIR = "./model_cache"
+# Configuration (read from environment for deployment)
+MONGO_URI = os.getenv("MONGO_URI", "")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "taniaWaters")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "orderData")
+MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "./model_cache")
 MODEL_FORMAT = 'joblib'
+
+# CORS configuration
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # comma-separated list or *
+ALLOWED_ORIGINS_LIST = [o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS != "*" else ["*"]
 
 # Create cache directory
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
@@ -27,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Sales Forecasting API - Clean Approach", version="3.0")
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS_LIST,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Global MongoDB client
 mongo_client = None
 db = None
@@ -36,6 +50,8 @@ def initialize_mongodb():
     """Initialize MongoDB connection"""
     global mongo_client, db, collection
     try:
+        if not MONGO_URI:
+            raise ValueError("MONGO_URI is not set. Please configure the environment variable.")
         mongo_client = MongoClient(MONGO_URI)
         mongo_client.admin.command('ping')
         db = mongo_client[DATABASE_NAME]
@@ -474,5 +490,5 @@ if __name__ == "__main__":
     print("Starting Sales Forecasting API - Clean Approach")
     print(f"Database: {DATABASE_NAME}.{COLLECTION_NAME}")
     print(f"Model format: {MODEL_FORMAT}")
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
