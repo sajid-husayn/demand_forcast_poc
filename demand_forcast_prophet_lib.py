@@ -359,13 +359,16 @@ async def customer_product_forecast(
         # Format response according to your specification
         response = []
         for _, row in future_forecast.iterrows():
+            yhat = max(0.0, float(row['yhat']))
+            yhat_upper = max(0.0, float(row['yhat_upper']))
+            yhat_lower = max(0.0, float(row['yhat_lower']))
             response.append({
                 "customer_name": customer_name,
                 "date": row['ds'].strftime('%Y-%m-%d'),
                 "product_name": product_name,
-                "predicted_count": round(row['yhat'], 2),
-                "predicted_upper_bound": round(row['yhat_upper'], 2),
-                "predicted_lower_bound": round(row['yhat_lower'], 2)
+                "predicted_count": round(yhat, 2),
+                "predicted_upper_bound": round(yhat_upper, 2),
+                "predicted_lower_bound": round(yhat_lower, 2)
             })
         
         return response
@@ -397,12 +400,15 @@ async def customer_total_forecast(
         # Format response according to your specification (no product_name field)
         response = []
         for _, row in future_forecast.iterrows():
+            yhat = max(0.0, float(row['yhat']))
+            yhat_upper = max(0.0, float(row['yhat_upper']))
+            yhat_lower = max(0.0, float(row['yhat_lower']))
             response.append({
                 "customer_name": customer_name,
                 "date": row['ds'].strftime('%Y-%m-%d'),
-                "predicted_count": round(row['yhat'], 2),
-                "predicted_upper_bound": round(row['yhat_upper'], 2),
-                "predicted_lower_bound": round(row['yhat_lower'], 2)
+                "predicted_count": round(yhat, 2),
+                "predicted_upper_bound": round(yhat_upper, 2),
+                "predicted_lower_bound": round(yhat_lower, 2)
             })
         
         return response
