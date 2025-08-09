@@ -70,11 +70,13 @@ def initialize_mongodb():
         logger.error(f"Failed to connect to MongoDB: {str(e)}")
         return False
 
-def get_model_cache_key(customer: str, product: str = None) -> str:
-    """Generate unique cache key for each model"""
+def get_model_cache_key(customer: str, product: str = None, skip_fridays: bool = False) -> str:
+    """Generate unique cache key for each model (include skip_fridays flag)"""
     key = f"customer_{customer.replace(' ', '_').replace('/', '_')}"
     if product:
         key += f"_product_{product.replace(' ', '_').replace('×', 'x').replace('/', '_')}"
+    if skip_fridays:
+        key += "_nofriday"
     return os.path.join(MODEL_CACHE_DIR, f"{key}.joblib")
 
 def load_cached_model(cache_key: str):
@@ -105,7 +107,7 @@ def save_model_to_cache(model, cache_key: str):
     except Exception as e:
         logger.error(f"Failed to save model: {str(e)}")
 
-def get_customer_product_data(customer: str, product: str) -> pd.DataFrame:
+def get_customer_product_data(customer: str, product: str, skip_fridays: bool = False) -> pd.DataFrame:
     """Get data for specific customer + product combination"""
     try:
         query = {
@@ -139,6 +141,11 @@ def get_customer_product_data(customer: str, product: str) -> pd.DataFrame:
         # Clean data
         df = df.dropna(subset=['ds', 'y'])
         df = df[df['y'] > 0]
+
+        if skip_fridays:
+            # Drop Saudi weekend days (Friday=4, Saturday=5)
+            df = df[~df['ds'].dt.weekday.isin({4, 5})]
+            logger.info(f"Filtered out Friday+Saturday (Saudi weekend), {len(df)} data points remain for {customer} - {product}")
         
         logger.info(f"Loaded {len(df)} data points for {customer} - {product}")
         return df[['ds', 'y']].sort_values('ds')
@@ -146,7 +153,7 @@ def get_customer_product_data(customer: str, product: str) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"Failed to get customer-product data: {str(e)}")
 
-def get_customer_aggregated_data(customer: str) -> pd.DataFrame:
+def get_customer_aggregated_data(customer: str, skip_fridays: bool = False) -> pd.DataFrame:
     """Get aggregated data for all products of a customer (sum quantities by date)"""
     try:
         query = {"soldToPartyName": customer}
@@ -224,15 +231,19 @@ def get_customer_aggregated_data(customer: str) -> pd.DataFrame:
             for item in aggregated_data
         ])
         
+        if skip_fridays:
+            df = df[~df['ds'].dt.weekday.isin({4, 5})]
+            logger.info(f"Filtered out Friday+Saturday (Saudi weekend), {len(df)} aggregated data points remain for customer {customer}")
+        
         logger.info(f"Loaded {len(df)} aggregated data points for customer {customer}")
         return df.sort_values('ds')
         
     except Exception as e:
         raise RuntimeError(f"Failed to get customer aggregated data: {str(e)}")
 
-def train_customer_product_model(customer: str, product: str, force_retrain: bool = False):
+def train_customer_product_model(customer: str, product: str, force_retrain: bool = False, skip_fridays: bool = False):
     """Train model for specific customer + product"""
-    cache_key = get_model_cache_key(customer, product)
+    cache_key = get_model_cache_key(customer, product, skip_fridays)
     
     if not force_retrain:
         cached_model = load_cached_model(cache_key)
@@ -240,12 +251,12 @@ def train_customer_product_model(customer: str, product: str, force_retrain: boo
             return cached_model
     
     # Get data and train model
-    df = get_customer_product_data(customer, product)
+    df = get_customer_product_data(customer, product, skip_fridays)
     
     if len(df) < 2:
         raise ValueError(f"Insufficient data points for training (found {len(df)}, need at least 2)")
     
-    logger.info(f"Training model for {customer} - {product} with {len(df)} data points")
+    logger.info(f"Training model for {customer} - {product} with {len(df)} data points (skip_fridays={skip_fridays})")
     
     model = Prophet(
         seasonality_mode='multiplicative',
@@ -258,9 +269,9 @@ def train_customer_product_model(customer: str, product: str, force_retrain: boo
     save_model_to_cache(model, cache_key)
     return model
 
-def train_customer_total_model(customer: str, force_retrain: bool = False):
+def train_customer_total_model(customer: str, force_retrain: bool = False, skip_fridays: bool = False):
     """Train model for customer total (aggregated across all products)"""
-    cache_key = get_model_cache_key(customer)  # No product specified
+    cache_key = get_model_cache_key(customer, None, skip_fridays)  # include skip_fridays flag
     
     if not force_retrain:
         cached_model = load_cached_model(cache_key)
@@ -268,12 +279,12 @@ def train_customer_total_model(customer: str, force_retrain: bool = False):
             return cached_model
     
     # Get aggregated data and train model
-    df = get_customer_aggregated_data(customer)
+    df = get_customer_aggregated_data(customer, skip_fridays)
     
     if len(df) < 2:
         raise ValueError(f"Insufficient aggregated data points for training (found {len(df)}, need at least 2)")
     
-    logger.info(f"Training aggregated model for {customer} with {len(df)} data points")
+    logger.info(f"Training aggregated model for {customer} with {len(df)} data points (skip_fridays={skip_fridays})")
     
     model = Prophet(
         seasonality_mode='multiplicative',
@@ -285,6 +296,34 @@ def train_customer_total_model(customer: str, force_retrain: bool = False):
     
     save_model_to_cache(model, cache_key)
     return model
+
+def _get_future_non_weekend_forecast(model: Prophet, horizon: int):
+    """
+    Helper: create forecasts for future days excluding Saudi weekend (Friday, Saturday).
+    Ensures we return exactly `horizon` future rows that are not on weekend days (if possible).
+    """
+    # Start with a generous number of periods; expand if necessary
+    periods = max(horizon * 2, horizon + 30)
+    max_periods = max(horizon * 10, 365)
+    tries = 0
+    weekend_days = {4, 5}  # Friday=4, Saturday=5
+
+    while True:
+        future = model.make_future_dataframe(periods=periods)
+        forecast = model.predict(future)
+        # get only future rows (ds > last training ds)
+        last_train = model.history['ds'].max()
+        future_pred = forecast[forecast['ds'] > last_train].copy()
+        # filter out weekend days (Friday & Saturday)
+        future_non_weekend = future_pred[~future_pred['ds'].dt.weekday.isin(weekend_days)]
+        if len(future_non_weekend) >= horizon or periods >= max_periods:
+            return future_non_weekend.head(horizon)
+        # increase periods and retry
+        periods = int(periods * 1.5) + 10
+        tries += 1
+        if tries > 10:
+            # fallback: return what we have
+            return future_non_weekend.head(horizon)
 
 @app.on_event("startup")
 async def startup_event():
@@ -339,36 +378,46 @@ async def customer_product_forecast(
     customer_name: str,
     product_name: str,
     horizon: int = 30,
-    force_retrain: bool = False
+    force_retrain: bool = False,
+    skip_fridays: bool = False
 ):
     """
     API 1: Forecast for specific customer + product combination
+    skip_fridays: if true, Saudi weekend (Friday+Saturday) will be excluded from training and from the returned predictions.
     Returns: Array of predictions with customer_name, date, product_name, predicted_count, bounds
     """
     try:
-        # Train/load model for this customer + product
-        model = train_customer_product_model(customer_name, product_name, force_retrain)
+        # Train/load model for this customer + product (pass skip_fridays)
+        model = train_customer_product_model(customer_name, product_name, force_retrain, skip_fridays)
         
-        # Generate future dates
-        future = model.make_future_dataframe(periods=horizon)
-        forecast = model.predict(future)
+        # Generate future predictions; if skip_fridays True, get non-weekend future rows
+        if skip_fridays:
+            future_forecast = _get_future_non_weekend_forecast(model, horizon)
+        else:
+            future = model.make_future_dataframe(periods=horizon)
+            forecast = model.predict(future)
+            # only take the last `horizon` rows (future)
+            future_forecast = forecast.tail(horizon)
         
-        # Get only future predictions (last 'horizon' days)
-        future_forecast = forecast.tail(horizon)
-        
-        # Format response according to your specification
+        # Format response according to your specification and clamp negatives to 0
         response = []
         for _, row in future_forecast.iterrows():
-            yhat = max(0.0, float(row['yhat']))
-            yhat_upper = max(0.0, float(row['yhat_upper']))
-            yhat_lower = max(0.0, float(row['yhat_lower']))
+            yhat = float(row.get('yhat', 0.0))
+            yhat_upper = float(row.get('yhat_upper', 0.0))
+            yhat_lower = float(row.get('yhat_lower', 0.0))
+
+            predicted_count = round(max(0.0, yhat), 2)
+            # Ensure bounds make sense and are not negative
+            predicted_lower = round(max(0.0, yhat_lower), 2)
+            predicted_upper = round(max(predicted_count, yhat_upper, 0.0), 2)
+
             response.append({
                 "customer_name": customer_name,
                 "date": row['ds'].strftime('%Y-%m-%d'),
                 "product_name": product_name,
-                "predicted_count": round(yhat, 2),
-                "predicted_upper_bound": round(yhat_upper, 2),
-                "predicted_lower_bound": round(yhat_lower, 2)
+                "predicted_count": predicted_count,
+                "predicted_upper_bound": predicted_upper,
+                "predicted_lower_bound": predicted_lower
             })
         
         return response
@@ -380,35 +429,43 @@ async def customer_product_forecast(
 async def customer_total_forecast(
     customer_name: str,
     horizon: int = 30,
-    force_retrain: bool = False
+    force_retrain: bool = False,
+    skip_fridays: bool = False
 ):
     """
     API 2: Forecast for customer total (all products aggregated)
+    skip_fridays: if true, Saudi weekend (Friday+Saturday) will be excluded from training and from the returned predictions.
     Returns: Array of predictions with customer_name, date, predicted_count, bounds (no product_name)
     """
     try:
-        # Train/load model for this customer's aggregated data
-        model = train_customer_total_model(customer_name, force_retrain)
+        # Train/load model for this customer's aggregated data (pass skip_fridays)
+        model = train_customer_total_model(customer_name, force_retrain, skip_fridays)
         
         # Generate future dates
-        future = model.make_future_dataframe(periods=horizon)
-        forecast = model.predict(future)
+        if skip_fridays:
+            future_forecast = _get_future_non_weekend_forecast(model, horizon)
+        else:
+            future = model.make_future_dataframe(periods=horizon)
+            forecast = model.predict(future)
+            future_forecast = forecast.tail(horizon)
         
-        # Get only future predictions (last 'horizon' days)
-        future_forecast = forecast.tail(horizon)
-        
-        # Format response according to your specification (no product_name field)
+        # Format response (clamp negatives to 0)
         response = []
         for _, row in future_forecast.iterrows():
-            yhat = max(0.0, float(row['yhat']))
-            yhat_upper = max(0.0, float(row['yhat_upper']))
-            yhat_lower = max(0.0, float(row['yhat_lower']))
+            yhat = float(row.get('yhat', 0.0))
+            yhat_upper = float(row.get('yhat_upper', 0.0))
+            yhat_lower = float(row.get('yhat_lower', 0.0))
+
+            predicted_count = round(max(0.0, yhat), 2)
+            predicted_lower = round(max(0.0, yhat_lower), 2)
+            predicted_upper = round(max(predicted_count, yhat_upper, 0.0), 2)
+
             response.append({
                 "customer_name": customer_name,
                 "date": row['ds'].strftime('%Y-%m-%d'),
-                "predicted_count": round(yhat, 2),
-                "predicted_upper_bound": round(yhat_upper, 2),
-                "predicted_lower_bound": round(yhat_lower, 2)
+                "predicted_count": predicted_count,
+                "predicted_upper_bound": predicted_upper,
+                "predicted_lower_bound": predicted_lower
             })
         
         return response
